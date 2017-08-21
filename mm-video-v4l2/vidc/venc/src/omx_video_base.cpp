@@ -271,6 +271,7 @@ omx_video::omx_video():
     output_use_buffer (false),
     pending_input_buffers(0),
     pending_output_buffers(0),
+    allocate_native_handle(false),
     m_out_bm_count(0),
     m_inp_bm_count(0),
     m_flags(0),
@@ -290,6 +291,8 @@ omx_video::omx_video():
     pthread_mutex_init(&m_lock, NULL);
     sem_init(&m_cmd_lock,0,0);
     DEBUG_PRINT_LOW("meta_buffer_hdr = %p", meta_buffer_hdr);
+
+    pthread_mutex_init(&m_buf_lock, NULL);
 }
 
 
@@ -331,6 +334,8 @@ omx_video::~omx_video()
     sem_destroy(&m_cmd_lock);
     DEBUG_PRINT_HIGH("m_etb_count = %"PRIu64", m_fbd_count = %"PRIu64, m_etb_count,
             m_fbd_count);
+
+    pthread_mutex_destroy(&m_buf_lock);
     DEBUG_PRINT_HIGH("omx_video: Destructor exit");
     DEBUG_PRINT_HIGH("Exiting OMX Video Encoder ...");
 }
@@ -2147,6 +2152,8 @@ OMX_ERRORTYPE  omx_video::get_config(OMX_IN OMX_HANDLETYPE      hComp,
 
 }
 
+#define extn_equals(param, extn) (!strcmp(param, extn))
+
 /* ======================================================================
    FUNCTION
    omx_video::GetExtensionIndex
@@ -2194,6 +2201,12 @@ OMX_ERRORTYPE  omx_video::get_extension_index(OMX_IN OMX_HANDLETYPE      hComp,
         *indexType = (OMX_INDEXTYPE)OMX_QTIIndexConfigDescribeColorAspects;
         return OMX_ErrorNone;
     }
+
+    if (extn_equals(paramName, "OMX.google.android.index.allocateNativeHandle")) {
+        *indexType = (OMX_INDEXTYPE)OMX_GoogleAndroidIndexAllocateNativeHandle;
+        return OMX_ErrorNone;
+    }
+
     return OMX_ErrorNotImplemented;
 }
 
@@ -2451,6 +2464,7 @@ OMX_ERRORTYPE  omx_video::use_output_buffer(
         return OMX_ErrorBadParameter;
     }
 
+    auto_lock l(m_buf_lock);
     if (!m_out_mem_ptr) {
         output_use_buffer = true;
         int nBufHdrSize        = 0;
@@ -2638,6 +2652,7 @@ OMX_ERRORTYPE  omx_video::use_buffer(
         return OMX_ErrorInvalidState;
     }
     if (port == PORT_INDEX_IN) {
+        auto_lock l(m_lock);
         eRet = use_input_buffer(hComp,bufferHdr,port,appData,bytes,buffer);
     } else if (port == PORT_INDEX_OUT) {
         eRet = use_output_buffer(hComp,bufferHdr,port,appData,bytes,buffer);
@@ -2768,17 +2783,23 @@ OMX_ERRORTYPE omx_video::free_output_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
             if(!secure_session) {
                 munmap (m_pOutput_pmem[index].buffer,
                         m_pOutput_pmem[index].size);
-            } else {
-                char *data = (char*) m_pOutput_pmem[index].buffer;
-                native_handle_t *handle = NULL;
-                memcpy(&handle, data + sizeof(OMX_U32), sizeof(native_handle_t*));
+                close (m_pOutput_pmem[index].fd);
+            } else if (m_pOutput_pmem[index].buffer) {
+                native_handle_t *handle;
+                if (allocate_native_handle) {
+                    handle = (native_handle_t *)m_pOutput_pmem[index].buffer;
+                } else {
+                    handle = ((output_metabuffer *)m_pOutput_pmem[index].buffer)->nh;
+                    free(m_pOutput_pmem[index].buffer);
+                }
+                native_handle_close(handle);
                 native_handle_delete(handle);
-                free(m_pOutput_pmem[index].buffer);
             }
-            close (m_pOutput_pmem[index].fd);
 #ifdef USE_ION
             free_ion_memory(&m_pOutput_ion[index]);
 #endif
+
+            m_pOutput_pmem[index].buffer = NULL;
             m_pOutput_pmem[index].fd = -1;
         } else if ( m_pOutput_pmem[index].fd > 0 && (output_use_buffer == true
                     && m_use_output_pmem == OMX_FALSE)) {
@@ -2824,7 +2845,9 @@ OMX_ERRORTYPE omx_video::allocate_input_meta_buffer(
                 meta_buffer_hdr, m_inp_mem_ptr);
     }
     for (index = 0; ((index < m_sInPortDef.nBufferCountActual) &&
-                meta_buffer_hdr[index].pBuffer); index++);
+                meta_buffer_hdr[index].pBuffer &&
+                BITMASK_PRESENT(&m_inp_bm_count, index)); index++);
+
     if (index == m_sInPortDef.nBufferCountActual) {
         DEBUG_PRINT_ERROR("All buffers are allocated input_meta_buffer");
         return OMX_ErrorBadParameter;
@@ -3163,20 +3186,37 @@ OMX_ERRORTYPE  omx_video::allocate_output_buffer(
             else {
                 //This should only be used for passing reference to source type and
                 //secure handle fd struct native_handle_t*
-                native_handle_t *handle = native_handle_create(1, 3); //fd, offset, size, alloc length
-                if (!handle) {
-                    DEBUG_PRINT_ERROR("ERROR: native handle creation failed");
-                    return OMX_ErrorInsufficientResources;
+                if (allocate_native_handle) {
+                    native_handle_t *nh = native_handle_create(1 /*numFds*/, 3 /*numInts*/);
+                    if (!nh) {
+                        DEBUG_PRINT_ERROR("Native handle create failed");
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    nh->data[0] = m_pOutput_pmem[i].fd;
+                    nh->data[1] = 0;
+                    nh->data[2] = 0;
+                    nh->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
+                    m_pOutput_pmem[i].buffer = (OMX_U8 *)nh;
+                } else {
+                    native_handle_t *handle = native_handle_create(1, 3); //fd, offset, size, alloc length
+                    if (!handle) {
+                        DEBUG_PRINT_ERROR("ERROR: native handle creation failed");
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    m_pOutput_pmem[i].buffer = malloc(sizeof(output_metabuffer));
+                    if (m_pOutput_pmem[i].buffer == NULL) {
+                        DEBUG_PRINT_ERROR("%s: Failed to allocate meta buffer", __func__);
+                        return OMX_ErrorInsufficientResources;
+                    }
+                    (*bufferHdr)->nAllocLen = sizeof(output_metabuffer);
+                    handle->data[0] = m_pOutput_pmem[i].fd;
+                    handle->data[1] = 0;
+                    handle->data[2] = 0;
+                    handle->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
+                    output_metabuffer *buffer = (output_metabuffer*) m_pOutput_pmem[i].buffer;
+                    buffer->type = 1;
+                    buffer->nh = handle;
                 }
-                m_pOutput_pmem[i].buffer = malloc(sizeof(output_metabuffer));
-                (*bufferHdr)->nAllocLen = sizeof(output_metabuffer);
-                handle->data[0] = m_pOutput_pmem[i].fd;
-                handle->data[1] = 0;
-                handle->data[2] = 0;
-                handle->data[3] = ALIGN(m_sOutPortDef.nBufferSize, 4096);
-                output_metabuffer *buffer = (output_metabuffer*) m_pOutput_pmem[i].buffer;
-                buffer->type = 1;
-                buffer->nh = handle;
             }
 
             (*bufferHdr)->pBuffer = (OMX_U8 *)m_pOutput_pmem[i].buffer;
@@ -3230,6 +3270,7 @@ OMX_ERRORTYPE  omx_video::allocate_buffer(OMX_IN OMX_HANDLETYPE                h
 
     // What if the client calls again.
     if (port == PORT_INDEX_IN) {
+        auto_lock l(m_lock);
 #ifdef _ANDROID_ICS_
         if (meta_mode_enable)
             eRet = allocate_input_meta_buffer(hComp,bufferHdr,appData,bytes);
@@ -3324,10 +3365,12 @@ OMX_ERRORTYPE  omx_video::free_buffer(OMX_IN OMX_HANDLETYPE         hComp,
 
         DEBUG_PRINT_LOW("free_buffer on i/p port - Port idx %u, actual cnt %u",
                 nPortIndex, (unsigned int)m_sInPortDef.nBufferCountActual);
+        pthread_mutex_lock(&m_lock);
         if (nPortIndex < m_sInPortDef.nBufferCountActual &&
                 BITMASK_PRESENT(&m_inp_bm_count, nPortIndex)) {
             // Clear the bit associated with it.
             BITMASK_CLEAR(&m_inp_bm_count,nPortIndex);
+            pthread_mutex_unlock(&m_lock);
             free_input_buffer (buffer);
             m_sInPortDef.bPopulated = OMX_FALSE;
 
@@ -3355,6 +3398,7 @@ OMX_ERRORTYPE  omx_video::free_buffer(OMX_IN OMX_HANDLETYPE         hComp,
 #endif
             }
         } else {
+            pthread_mutex_unlock(&m_lock);
             DEBUG_PRINT_ERROR("ERROR: free_buffer ,Port Index Invalid");
             eRet = OMX_ErrorBadPortIndex;
         }
@@ -3375,6 +3419,7 @@ OMX_ERRORTYPE  omx_video::free_buffer(OMX_IN OMX_HANDLETYPE         hComp,
                 nPortIndex, (unsigned int)m_sOutPortDef.nBufferCountActual);
         if (nPortIndex < m_sOutPortDef.nBufferCountActual &&
                 BITMASK_PRESENT(&m_out_bm_count, nPortIndex)) {
+            auto_lock l(m_buf_lock);
             // Clear the bit associated with it.
             BITMASK_CLEAR(&m_out_bm_count,nPortIndex);
             m_sOutPortDef.bPopulated = OMX_FALSE;
@@ -3635,7 +3680,7 @@ OMX_ERRORTYPE  omx_video::empty_this_buffer_proxy(OMX_IN OMX_HANDLETYPE  hComp,
 
         auto_lock l(m_lock);
         pmem_data_buf = (OMX_U8 *)m_pInput_pmem[nBufIndex].buffer;
-        if (pmem_data_buf) {
+        if (pmem_data_buf && BITMASK_PRESENT(&m_inp_bm_count, nBufIndex)) {
             memcpy (pmem_data_buf, (buffer->pBuffer + buffer->nOffset),
                     buffer->nFilledLen);
         }

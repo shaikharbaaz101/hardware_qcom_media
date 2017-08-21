@@ -652,6 +652,7 @@ class omx_video: public qc_omx_component
         omx_cmd_queue m_opq_meta_q;
         omx_cmd_queue m_opq_pmem_q;
         OMX_BUFFERHEADERTYPE meta_buffer_hdr[MAX_NUM_INPUT_BUFFERS];
+        pthread_mutex_t m_buf_lock;
 
         bool input_flush_progress;
         bool output_flush_progress;
@@ -659,6 +660,8 @@ class omx_video: public qc_omx_component
         bool output_use_buffer;
         int pending_input_buffers;
         int pending_output_buffers;
+
+        bool allocate_native_handle;
 
         uint64_t m_out_bm_count;
         uint64_t m_inp_bm_count;
